@@ -1,0 +1,324 @@
+# Offline-First Branch — Implementation Plan
+
+> **Branch:** `offline-first` (forked from `main`)
+> **Status:** Plan only — no code changes yet
+> **Goal:** Fully provider-pluggable simulator where **offline (Ollama + Whisper + Piper + self-hosted LiveKit OSS) is the default**, with optional Gemini and last-resort Anthropic Claude as cloud fallbacks. The entire stack runs from a single `docker compose up`.
+
+---
+
+## 1. Decisions (locked)
+
+| # | Decision |
+|---|---|
+| 1 | **LiveKit:** self-hosted LiveKit OSS via Docker, with full setup documentation. |
+| 2 | **Default LLM:** `medgemma1.5:4b` via Ollama (already pulled locally) for both patient persona and attending debrief. Larger Ollama models can be configured via env. |
+| 3 | **STT / TTS:** `faster-whisper` (STT) + `Piper` (TTS), both offline. |
+| 4 | **Branch model:** fully provider-pluggable. Offline is the default. Gemini and Claude are opt-in via env. |
+| 5 | **Deployment:** single `docker compose up` brings up Ollama, LiveKit OSS, Whisper sidecar, Piper sidecar, FastAPI backend, voice worker, and Vite dev server. |
+
+---
+
+## 2. Provider Abstraction
+
+### 2.1 LLM Providers
+
+```
+priority: OLLAMA (default) → GEMINI (optional) → CLAUDE (optional, last resort)
+```
+
+**TypeScript (browser-side, used only for non-streaming utility calls):**
+- `src/voice/providers/types.ts` — `LLMProvider` interface
+- `src/voice/providers/ollama.ts`
+- `src/voice/providers/gemini.ts`
+- `src/voice/providers/claude.ts`
+- `src/voice/providers/index.ts` — factory selecting based on env
+
+**Python (backend, used by FastAPI + voice worker):**
+- `backend/providers/base.py` — abstract `LLMProvider`
+- `backend/providers/ollama_provider.py`
+- `backend/providers/gemini_provider.py`
+- `backend/providers/claude_provider.py`
+- `backend/providers/factory.py`
+
+**Interface (conceptual):**
+```python
+class LLMProvider:
+    async def stream_chat(messages, system, tools=None) -> AsyncIterator[ChatDelta]
+    async def grade_attending(request: DebriefRequest) -> CaseEvaluation
+    @property
+    def supports_tools() -> bool
+```
+
+**Fallback behavior:** if the configured provider raises a connection or timeout error, the factory tries the next provider in the chain and logs the demotion (does not silently swallow).
+
+### 2.2 STT / TTS Providers
+
+| Capability | Default (offline) | Optional cloud fallback |
+|---|---|---|
+| STT | faster-whisper (`small.en` initially, configurable) | Deepgram |
+| TTS | Piper (multiple voices for adult M/F + parent M/F + child) | Cartesia |
+
+Same factory pattern: `backend/providers/stt/{whisper,deepgram}.py`, `backend/providers/tts/{piper,cartesia}.py`.
+
+---
+
+## 3. Models
+
+### 3.1 LLM (Ollama)
+
+| Role | Default model | Notes |
+|---|---|---|
+| Patient persona | `medgemma1.5:4b` | Already pulled. Fast and clinically-aware. |
+| Attending debrief | `medgemma1.5:4b` | Same model by default. Override via `OLLAMA_MODEL_ATTENDING` to use a heavier model (`qwen2.5:14b-instruct`, `mixtral:8x7b`, etc.) when available. |
+
+**Tool calling:** `medgemma` is Gemma-based and does not natively guarantee OpenAI-compatible tool-calling. Strategy:
+1. Prefer **structured JSON output** with a strict response schema for the attending debrief (more portable across small models).
+2. The factory exposes `supports_tools` — Ollama provider returns `false` and uses JSON-schema prompting; Gemini and Claude providers return `true` and use real tool calls.
+3. A shared parser converts both shapes into the same `CaseEvaluation` object the UI already expects.
+
+### 3.2 STT — faster-whisper
+
+| Variant | Size | Latency | Use when |
+|---|---|---|---|
+| `small.en` | ~466 MB | low | default |
+| `medium.en` | ~1.5 GB | medium | better accuracy |
+| `large-v3` | ~3 GB | high | offline-only with GPU |
+
+Configurable via `WHISPER_MODEL`. Streaming achieved via VAD-driven chunking inside the voice worker.
+
+### 3.3 TTS — Piper
+
+Voice IDs (downloaded into a shared volume on first run):
+- `en_US-amy-medium` (adult female)
+- `en_US-ryan-medium` (adult male)
+- `en_US-lessac-medium` (parent female)
+- `en_US-joe-medium` (parent male)
+- `en_US-kathleen-low` (child)
+
+`patientPersona.ts` already picks gender deterministically by FNV-1a hash on `caseId`; we extend the picker to map gender → Piper voice id (no logic change in the persona builder itself).
+
+---
+
+## 4. LiveKit OSS — Self-Hosted
+
+**Why keep LiveKit:** zero changes to `voice_agent.py` worker logic, browser already speaks LiveKit, lip-sync analyser tap continues to work.
+
+**Setup:**
+- `livekit/livekit-server` Docker image
+- Bundled with a generated `livekit.yaml` (config) — keys + secret pre-baked for local dev, regenerated on first `docker compose up` if missing.
+- TURN/STUN: localhost-only, no relays needed for single-machine dev.
+- TLS not required for `localhost` (LiveKit allows insecure WS in dev).
+
+**Config surfaces:**
+```
+LIVEKIT_URL=ws://livekit:7880
+LIVEKIT_API_KEY=devkey
+LIVEKIT_API_SECRET=<auto-generated 32-byte secret on first boot>
+LIVEKIT_MODE=local | cloud
+```
+
+When `LIVEKIT_MODE=cloud`, the factory points at the Cloud URL/keys instead.
+
+---
+
+## 5. Docker Compose Architecture
+
+Single command: `docker compose -f docker-compose.offline.yml up`
+
+```
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│  vite-dev       │ ───► │  fastapi-       │ ───► │  ollama         │
+│  (5173)         │      │  backend (8787) │      │  (11434)        │
+└─────────────────┘      │                 │      └─────────────────┘
+        │                │                 │
+        │                │                 │ ───► ┌─────────────────┐
+        │                │                 │      │  gemini (cloud) │
+        │                │                 │      │  optional       │
+        │                │                 │      └─────────────────┘
+        │                │                 │
+        │                │                 │ ───► ┌─────────────────┐
+        │                │                 │      │  claude (cloud) │
+        │                │                 │      │  optional       │
+        │                └──────┬──────────┘      └─────────────────┘
+        │                       │
+        │                       ▼
+        │                ┌─────────────────┐
+        │                │  voice-worker   │
+        │                │  (LiveKit       │
+        │                │   agent)        │
+        │                └──────┬──────────┘
+        │                       │
+        ▼                       ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│  livekit-       │      │  whisper-       │      │  piper-tts      │
+│  server (7880)  │      │  server (5001)  │      │  (5002)         │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+```
+
+### 5.1 Services
+
+| Service | Image / Build | Port | Volumes | Notes |
+|---|---|---|---|---|
+| `ollama` | `ollama/ollama:latest` | 11434 | `./.ollama:/root/.ollama` | Health-check pulls `medgemma1.5:4b` if absent |
+| `livekit` | `livekit/livekit-server:latest` | 7880, 7881 | `./livekit/livekit.yaml:/etc/livekit.yaml` | Local-dev TLS-off |
+| `whisper` | Custom (`./docker/whisper.Dockerfile` — Python + faster-whisper + simple FastAPI) | 5001 | `./.models/whisper:/models` | Loads model at boot |
+| `piper` | Custom (`./docker/piper.Dockerfile`) | 5002 | `./.models/piper:/models` | Streams WAV/PCM over HTTP |
+| `backend` | `./docker/backend.Dockerfile` | 8787 | `./backend:/app` | Reads `.env.local` |
+| `voice-worker` | `./docker/voice-worker.Dockerfile` | — | `./backend:/app` | Connects to LiveKit + Whisper + Piper + Ollama |
+| `frontend` | `node:22-alpine` (build) | 5173 | `./:/app` | Runs `npm run dev` |
+
+### 5.2 First-boot helper
+
+`scripts/setup-offline.sh`:
+1. Verify Docker + Compose are installed.
+2. Generate `livekit.yaml` with a fresh secret if it doesn't exist.
+3. `docker compose pull`.
+4. `docker compose up -d ollama` then `docker exec ollama ollama pull medgemma1.5:4b` (skipped if already present).
+5. Download Piper voices into `./.models/piper/` (idempotent).
+6. Download faster-whisper model into `./.models/whisper/` (idempotent).
+7. `docker compose up`.
+
+A single shorthand on the host: `./scripts/setup-offline.sh && docker compose -f docker-compose.offline.yml up`.
+
+### 5.3 GPU acceleration
+
+Optional `docker-compose.gpu.yml` overlay that adds `deploy.resources.reservations.devices` for NVIDIA. Enable with `docker compose -f docker-compose.offline.yml -f docker-compose.gpu.yml up`. CPU-only path remains the supported default.
+
+---
+
+## 6. Code Changes (file-level map, no implementation yet)
+
+### 6.1 New files
+
+```
+backend/
+├── providers/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── factory.py
+│   ├── ollama_provider.py
+│   ├── gemini_provider.py
+│   ├── claude_provider.py
+│   ├── stt/
+│   │   ├── __init__.py
+│   │   ├── whisper_provider.py
+│   │   └── deepgram_provider.py
+│   └── tts/
+│       ├── __init__.py
+│       ├── piper_provider.py
+│       └── cartesia_provider.py
+├── voice_agent_local.py        # offline voice worker (Whisper + Piper + Ollama)
+├── agent_local.py              # local attending debrief, replaces Managed Agents
+
+docker/
+├── backend.Dockerfile
+├── voice-worker.Dockerfile
+├── whisper.Dockerfile
+├── piper.Dockerfile
+└── frontend.Dockerfile
+
+livekit/
+└── livekit.yaml                # generated on first boot
+
+docker-compose.offline.yml
+docker-compose.gpu.yml          # optional GPU overlay
+
+scripts/
+├── setup-offline.sh
+├── pull-piper-voices.sh
+└── pull-whisper-model.sh
+
+src/voice/providers/
+├── types.ts
+├── ollama.ts
+├── gemini.ts
+├── claude.ts
+└── index.ts
+
+docs/
+├── OFFLINE_PLAN.md             # this file
+├── OFFLINE_SETUP.md            # user-facing setup guide
+└── PROVIDER_ARCHITECTURE.md    # provider abstraction reference
+```
+
+### 6.2 Modified files
+
+| File | Change |
+|---|---|
+| `backend/server.py` | Route `/agent/*` and `/voice/token` through `providers.factory`. Add `/agent/local/debrief` SSE route mirroring Managed Agents shape. |
+| `backend/.env.example` | New vars: `LLM_PROVIDER`, `STT_PROVIDER`, `TTS_PROVIDER`, `LIVEKIT_MODE`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL_PATIENT`, `OLLAMA_MODEL_ATTENDING`, `WHISPER_MODEL`, `WHISPER_URL`, `PIPER_URL`, `GEMINI_API_KEY`, `GEMINI_MODEL_PATIENT`, `GEMINI_MODEL_ATTENDING`. |
+| `src/voice/conversation.ts` | Read provider hint from `/voice/token` response (server picks); no client logic change beyond URL. |
+| `src/agents/managedAgent.ts` | When `provider !== claude`, point event-stream URL at `/agent/local/debrief` (same SSE shape). |
+| `src/agents/customTools.ts` | No change — schemas reused; provider layer maps to JSON-mode for Ollama. |
+| `package.json` | `dev:offline`, `setup:offline`, `verify:offline` scripts. |
+| `vite.config.ts` | No change (proxy already targets backend). |
+| `CLAUDE.md` | Add an "Offline mode" section pointing at `docs/OFFLINE_SETUP.md`. |
+
+### 6.3 Untouched
+
+- `src/game/*` (provider-agnostic)
+- `src/data/*` (pure data)
+- `src/components/*` (UI unchanged)
+- Existing `voice_agent.py` (kept for `LIVEKIT_MODE=cloud` + `LLM_PROVIDER=claude` path)
+
+---
+
+## 7. Environment Matrix
+
+| Var | Default (offline) | Notes |
+|---|---|---|
+| `LLM_PROVIDER` | `ollama` | `ollama \| gemini \| claude` |
+| `STT_PROVIDER` | `whisper` | `whisper \| deepgram` |
+| `TTS_PROVIDER` | `piper` | `piper \| cartesia` |
+| `LIVEKIT_MODE` | `local` | `local \| cloud` |
+| `OLLAMA_BASE_URL` | `http://ollama:11434` | inside Docker network |
+| `OLLAMA_MODEL_PATIENT` | `medgemma1.5:4b` | |
+| `OLLAMA_MODEL_ATTENDING` | `medgemma1.5:4b` | bump to 14B+ when available |
+| `WHISPER_URL` | `http://whisper:5001` | |
+| `WHISPER_MODEL` | `small.en` | |
+| `PIPER_URL` | `http://piper:5002` | |
+| `LIVEKIT_URL` | `ws://livekit:7880` | |
+| `LIVEKIT_API_KEY` | `devkey` | local-only |
+| `LIVEKIT_API_SECRET` | auto-generated | written to `livekit/livekit.yaml` |
+| `GEMINI_API_KEY` | _(unset)_ | required only if used |
+| `ANTHROPIC_API_KEY` | _(unset)_ | required only if used |
+
+---
+
+## 8. Verification & Rollout
+
+| Phase | Goal | Exit criterion |
+|---|---|---|
+| 1 | Provider abstraction merged with Claude still default | All existing tests pass; `npm run verify` green |
+| 2 | `offline-first` branch with Ollama + Whisper + Piper + LiveKit OSS in Docker | `docker compose -f docker-compose.offline.yml up` brings up healthy services |
+| 3 | Smoke-test patient persona | Round-trip latency (speech-end → first audio) < 2.5 s on a 16 GB / no-GPU host |
+| 4 | Attending debrief regression | Offline grade and Claude grade agree on critical-action presence/absence on 5 reference cases |
+| 5 | Documentation pass | `docs/OFFLINE_SETUP.md` walks a fresh contributor from zero to live voice in < 15 min |
+
+---
+
+## 9. Hardware Tiers
+
+| Tier | RAM | GPU | Suggested config |
+|---|---|---|---|
+| Minimum | 16 GB | none (CPU) | `medgemma1.5:4b` + `whisper-small.en` + Piper |
+| Recommended | 32 GB | 8 GB VRAM | `medgemma1.5:4b` patient + `qwen2.5:14b` attending + `whisper-medium.en` |
+| Strong | 64 GB | 24 GB VRAM | `mixtral:8x7b` attending + `whisper-large-v3` + Piper |
+
+---
+
+## 10. Open Items (track during implementation)
+
+1. Confirm faster-whisper streaming behaviour inside the LiveKit agent (alternative: VAD-chunked non-streaming) — measure latency before committing.
+2. Confirm `medgemma1.5:4b` JSON-mode reliability for the attending debrief schema; if it drifts, fall back to a two-pass prompt (draft → critique) or upgrade attending model by default.
+3. Decide whether to auto-pull models on first compose-up (slower first run) vs. require `setup-offline.sh` (faster first run, extra step). Plan currently says `setup-offline.sh`.
+4. Voice ID mapping for Piper — verify accent/age fit for pediatric parent personas before locking the voice list.
+
+---
+
+## 11. Out of Scope (for this branch)
+
+- Multi-host / production deployment.
+- Self-hosted Gemini-equivalent (e.g. self-hosted Llava-Med). Cloud Gemini remains the only Gemini path.
+- Removing the existing Managed Agents code — it stays behind `LLM_PROVIDER=claude`.
+- Any UI redesign — offline mode is invisible to the player.
