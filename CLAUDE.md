@@ -76,6 +76,19 @@ All keys server-side only, in `backend/.env.local`. The browser never sees them.
 
 Vite proxies `/agent/*` and `/voice/*` to `127.0.0.1:8787` in dev. When you add a new Claude-backed feature, route it through the backend the same way — never reintroduce a `VITE_*` Anthropic key.
 
+## Offline mode (`offline-first` branch)
+
+- Branch `offline-first` runs the simulator with no cloud dependencies by
+  default: Ollama (`medgemma1.5:4b`) for the LLM, faster-whisper for STT,
+  Piper for TTS, self-hosted LiveKit OSS for transport. Cloud Gemini and
+  Claude remain optional fallbacks.
+- All provider selection is env-driven via `LLM_PROVIDER`, `STT_PROVIDER`,
+  `TTS_PROVIDER`, and `LIVEKIT_MODE`. See `backend/.env.example`.
+- Single-command stack: `docker compose -f docker-compose.offline.yml up`
+  after `./scripts/setup-offline.sh`. See `docs/OFFLINE_SETUP.md`.
+- Architecture and contracts: `docs/PROVIDER_ARCHITECTURE.md`.
+- The `main` branch is untouched and still uses the cloud-only path.
+
 ## Out of scope
 
 - Multi-agent handoffs (Anthropic's feature is still in research preview).

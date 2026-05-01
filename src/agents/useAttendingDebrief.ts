@@ -29,6 +29,8 @@ import {
   type DebriefRequest,
   debriefRequestToUserMessage,
 } from './debriefRequest';
+import { openLocalDebriefStream } from './localDebrief';
+import { getProviderConfig, isManagedAgentMode } from '../voice/providers';
 
 export type DebriefStatus =
   | 'idle'
@@ -80,6 +82,28 @@ export function useAttendingDebrief(
 
     void (async () => {
       try {
+        const config = await getProviderConfig();
+        const useManaged = isManagedAgentMode(config);
+
+        if (!useManaged) {
+          // Offline path: one-shot SSE call, no bootstrap or session.
+          setStatus('streaming');
+          const result = await consumeLocalStream(
+            request,
+            ctrl.signal,
+            (e) => !cancelled && setEvaluation(e),
+            (delta) => !cancelled && setPartial((p) => p + delta),
+          );
+          if (cancelled) return;
+          if (result.kind === 'eval') setStatus('got-evaluation');
+          else if (result.kind === 'aborted') setStatus('aborted');
+          else if (result.kind === 'closed-without-eval') {
+            setStatus('error');
+            setError('Local agent stream closed without emitting a case evaluation.');
+          }
+          return;
+        }
+
         await bootstrap();
         const sessionId = await createSession(`debrief-${request.case_id}-${Date.now()}`)
           .then((s) => s.session_id);
@@ -198,3 +222,41 @@ async function consumeStream(
   }
   return gotEval ? { kind: 'eval' } : { kind: 'closed-without-eval' };
 }
+
+async function consumeLocalStream(
+  request: DebriefRequest,
+  signal: AbortSignal,
+  onEval: (e: CaseEvaluationInput) => void,
+  onPartialDelta: (delta: string) => void,
+): Promise<StreamResult> {
+  let gotEval = false;
+  const stream = openLocalDebriefStream(request, { signal });
+  for await (const ev of stream) {
+    if (signal.aborted) return { kind: 'aborted' };
+
+    if (ev.type === 'agent.text_delta') {
+      const text = (ev as { text?: unknown }).text;
+      if (typeof text === 'string') onPartialDelta(text);
+      continue;
+    }
+
+    if (ev.type === 'agent.custom_tool_use') {
+      const toolName = (ev as { name?: string }).name ?? '';
+      const input = (ev as { input?: unknown }).input;
+      const parsed = parseCustomToolUse(toolName, input);
+      if (!parsed.ok) continue;
+      if (parsed.call.name === 'render_case_evaluation') {
+        gotEval = true;
+        onEval(parsed.call.input);
+      }
+      continue;
+    }
+
+    if (ev.type === 'proxy_error') {
+      const msg = (ev as { message?: unknown }).message;
+      throw new Error(typeof msg === 'string' ? msg : 'local debrief failed');
+    }
+  }
+  return gotEval ? { kind: 'eval' } : { kind: 'closed-without-eval' };
+}
+

@@ -18,6 +18,10 @@ backend/samples/*.wav
 
 tsconfig.tsbuildinfo
 
+# Offline mode — runtime artefacts (do not commit)
+livekit/livekit.yaml
+.models/
+
 # `skills` CLI (vercel-labs/skills) — installed locally, not committed
 /.agents/
 /skills/

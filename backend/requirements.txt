@@ -10,3 +10,7 @@ anthropic>=0.88.0
 livekit-api~=0.8
 httpx==0.28.1
 slowapi==0.1.9
+
+# Offline-first provider deps (Ollama / Gemini both use httpx — no SDK needed).
+# faster-whisper is optional for in-process STT; the sidecar container
+# installs it independently.

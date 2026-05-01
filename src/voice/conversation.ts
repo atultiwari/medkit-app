@@ -100,6 +100,7 @@ async function fetchVoiceToken(opts: {
   systemPrompt: string;
   initialLine: string;
   gender: 'M' | 'F';
+  isPediatric?: boolean;
 }): Promise<VoiceTokenResponse> {
   const r = await fetch('/voice/token', {
     method: 'POST',

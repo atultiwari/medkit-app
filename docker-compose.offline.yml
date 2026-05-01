@@ -1,0 +1,175 @@
+# medkit — offline-first stack.
+#
+# Brings up the entire system on a single machine with no cloud dependencies:
+#   - Ollama for LLM inference (default model: medgemma1.5:4b)
+#   - LiveKit OSS for WebRTC voice transport
+#   - Whisper sidecar (faster-whisper) for STT
+#   - Piper sidecar for TTS
+#   - FastAPI backend
+#   - LiveKit voice agent worker (offline variant)
+#   - Vite dev server
+#
+# Usage:
+#   ./scripts/setup-offline.sh                       # one-time prep
+#   docker compose -f docker-compose.offline.yml up  # all services
+#
+# GPU acceleration (NVIDIA only):
+#   docker compose -f docker-compose.offline.yml -f docker-compose.gpu.yml up
+
+name: medkit-offline
+
+networks:
+  medkit:
+    driver: bridge
+
+volumes:
+  ollama-data:
+  whisper-models:
+  piper-voices:
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: medkit-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - medkit
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: medkit-livekit
+    restart: unless-stopped
+    ports:
+      - "7880:7880"  # WebSocket signalling
+      - "7881:7881"  # TCP fallback
+      - "7882:7882/udp"  # TURN/UDP
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    command: ["--config", "/etc/livekit.yaml"]
+    networks:
+      - medkit
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7880/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  whisper:
+    build:
+      context: .
+      dockerfile: docker/whisper.Dockerfile
+    container_name: medkit-whisper
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-small.en}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+    volumes:
+      - whisper-models:/models
+    networks:
+      - medkit
+
+  piper:
+    build:
+      context: .
+      dockerfile: docker/piper.Dockerfile
+    container_name: medkit-piper
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    volumes:
+      - piper-voices:/models
+    networks:
+      - medkit
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: medkit-backend
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      whisper:
+        condition: service_started
+      piper:
+        condition: service_started
+    ports:
+      - "8787:8787"
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      STT_PROVIDER: ${STT_PROVIDER:-whisper}
+      TTS_PROVIDER: ${TTS_PROVIDER:-piper}
+      LIVEKIT_MODE: ${LIVEKIT_MODE:-local}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL_PATIENT: ${OLLAMA_MODEL_PATIENT:-medgemma1.5:4b}
+      OLLAMA_MODEL_ATTENDING: ${OLLAMA_MODEL_ATTENDING:-medgemma1.5:4b}
+      WHISPER_URL: ${WHISPER_URL:-http://whisper:5001}
+      WHISPER_MODEL: ${WHISPER_MODEL:-small.en}
+      PIPER_URL: ${PIPER_URL:-http://piper:5002}
+      LLM_FALLBACK_CHAIN: ${LLM_FALLBACK_CHAIN:-ollama}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    networks:
+      - medkit
+
+  voice-worker:
+    build:
+      context: .
+      dockerfile: docker/voice-worker.Dockerfile
+    container_name: medkit-voice-worker
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+      whisper:
+        condition: service_started
+      piper:
+        condition: service_started
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      STT_PROVIDER: ${STT_PROVIDER:-whisper}
+      TTS_PROVIDER: ${TTS_PROVIDER:-piper}
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL_PATIENT: ${OLLAMA_MODEL_PATIENT:-medgemma1.5:4b}
+      WHISPER_URL: ${WHISPER_URL:-http://whisper:5001}
+      PIPER_URL: ${PIPER_URL:-http://piper:5002}
+    networks:
+      - medkit
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: medkit-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_BACKEND_URL: http://backend:8787
+    networks:
+      - medkit

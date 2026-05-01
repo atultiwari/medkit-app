@@ -1,0 +1,17 @@
+.git
+.gitignore
+node_modules
+dist
+backend/.venv
+backend/.venv-voice
+backend/.env.local
+.env
+.env.local
+docs
+agent
+loop
+public/screenshots
+*.log
+.idea
+.vscode
+.DS_Store

@@ -1,2 +1,5 @@
 livekit-agents[deepgram,cartesia,anthropic,silero,turn-detector]~=1.0
 python-dotenv~=1.0
+# Offline path also needs the OpenAI-compatible plugin (talks to Ollama via /v1).
+livekit-plugins-openai>=1.0
+httpx>=0.27

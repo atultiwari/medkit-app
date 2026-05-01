@@ -15,9 +15,18 @@ POST /voice/token    → mint LiveKit JWT for a patient room
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
+
+# Make `backend.providers` importable when this module is launched directly
+# via `python backend/server.py` (legacy host-side run mode). Under the
+# Docker entrypoint (`uvicorn backend.server:app`), PYTHONPATH already
+# includes /app so this is a no-op.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 def _load_env_local() -> None:
@@ -130,13 +139,30 @@ def health():
         and os.environ.get("LIVEKIT_API_KEY")
         and os.environ.get("LIVEKIT_API_SECRET")
     )
+    llm_provider = (os.environ.get("LLM_PROVIDER") or "ollama").lower()
+    stt_provider = (os.environ.get("STT_PROVIDER") or "whisper").lower()
+    tts_provider = (os.environ.get("TTS_PROVIDER") or "piper").lower()
+    livekit_mode = (os.environ.get("LIVEKIT_MODE") or "local").lower()
     return {
         "ok": True,
+        "providers": {
+            "llm": llm_provider,
+            "stt": stt_provider,
+            "tts": tts_provider,
+            "livekit_mode": livekit_mode,
+            "fallback_chain": os.environ.get("LLM_FALLBACK_CHAIN", llm_provider),
+        },
         "voice": {
             "transport": "livekit",
             "livekit_configured": livekit_ok,
             "deepgram_configured": bool(os.environ.get("DEEPGRAM_API_KEY")),
             "cartesia_configured": bool(os.environ.get("CARTESIA_API_KEY")),
+            "whisper_configured": bool(
+                os.environ.get("WHISPER_URL") or stt_provider == "whisper"
+            ),
+            "piper_configured": bool(
+                os.environ.get("PIPER_URL") or tts_provider == "piper"
+            ),
         },
         "agent": {
             "anthropic_sdk_installed": _HAS_ANTHROPIC,
@@ -145,6 +171,8 @@ def health():
             "agent_id": agent_id,
             "environment_id": env_id,
             "model": AGENT_MODEL if _HAS_ANTHROPIC else None,
+            "ollama_configured": bool(os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")),
+            "gemini_configured": bool(os.environ.get("GEMINI_API_KEY")),
         },
     }
 
@@ -1335,41 +1363,100 @@ class PatientStreamRequest(BaseModel):
 
 @app.post("/agent/patient/stream")
 async def patient_stream(req: PatientStreamRequest):
-    client = get_async_anthropic_client()
+    """Patient persona text stream. Routes through the active LLM provider
+    (Ollama by default; Gemini or Claude when configured). Returns SSE
+    frames `{"text": "..."}` deltas terminated with `{"done": true}`,
+    matching what the frontend has always consumed.
+    """
+    from backend.providers import ChatMessage, get_chain  # local import: defer venv resolution
+
+    chain = get_chain()
+    messages = [ChatMessage(role=m.role, content=m.content) for m in req.messages]
 
     async def generator():
-        try:
-            async with client.messages.stream(  # type: ignore[attr-defined]
-                model=PATIENT_MODEL,
-                max_tokens=PATIENT_MAX_TOKENS,
-                system=[
-                    {
-                        "type": "text",
-                        "text": req.system,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[
-                    {"role": m.role, "content": m.content} for m in req.messages
-                ],
-            ) as stream:
-                async for event in stream:
-                    etype = getattr(event, "type", None)
-                    if etype != "content_block_delta":
-                        continue
-                    delta = getattr(event, "delta", None)
-                    if getattr(delta, "type", None) != "text_delta":
-                        continue
-                    text = getattr(delta, "text", "")
-                    if not text:
-                        continue
-                    yield "data: " + json.dumps({"text": text}) + "\n\n"
-            yield "data: " + json.dumps({"done": True}) + "\n\n"
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            _agent_log.exception("patient stream failed")
-            yield "data: " + json.dumps({"error": str(e)}) + "\n\n"
+        last_error: Optional[str] = None
+        for provider in chain:
+            try:
+                async for delta in provider.stream_chat(
+                    messages=messages,
+                    system=req.system,
+                    max_tokens=PATIENT_MAX_TOKENS,
+                    temperature=0.8,
+                ):
+                    if delta.error:
+                        last_error = f"{provider.name}: {delta.error}"
+                        # Try the next provider in the chain. Don't yield
+                        # mid-stream errors to the browser — only the
+                        # final fallback's error surfaces.
+                        break
+                    if delta.text:
+                        yield "data: " + json.dumps({"text": delta.text}) + "\n\n"
+                    if delta.done:
+                        yield "data: " + json.dumps({"done": True}) + "\n\n"
+                        return
+                # Stream ended without `done` and without `error`: treat
+                # as success-with-no-final, send terminator.
+                if last_error is None:
+                    yield "data: " + json.dumps({"done": True}) + "\n\n"
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _agent_log.exception("provider %s failed; trying next", provider.name)
+                last_error = f"{provider.name}: {e}"
+                continue
+        # All providers exhausted.
+        yield "data: " + json.dumps({"error": last_error or "no providers available"}) + "\n\n"
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Local attending debrief (offline-first replacement for Managed Agents)
+# ───────────────────────────────────────────────────────────────────────────
+#
+# When LLM_PROVIDER != claude, the frontend hits this endpoint instead of
+# /agent/sessions/{id}/stream. The SSE shape matches the Managed-Agents
+# event stream the frontend's eventStreamRenderer.tsx already consumes,
+# so the UI doesn't change.
+
+class LocalDebriefRequest(BaseModel):
+    case_id: str
+    case_summary: dict
+    rubric: dict
+    registry_slice: dict
+    encounter_log: dict
+
+
+@app.post("/agent/local/debrief")
+async def local_debrief(req: LocalDebriefRequest):
+    """One-shot attending debrief via the active LLM provider. Streams
+    SSE events that mirror the Managed Agents event-stream shape so the
+    existing renderer just works.
+    """
+    from backend.providers import DebriefRequest as ProviderDebriefRequest
+    from backend.agent_local import run_local_debrief
+
+    debrief = ProviderDebriefRequest(
+        case_id=req.case_id,
+        case_summary=req.case_summary,
+        rubric=req.rubric,
+        registry_slice=req.registry_slice,
+        encounter_log=req.encounter_log,
+    )
+
+    async def generator():
+        yield ": connected\n\n"
+        async for sse in run_local_debrief(debrief):
+            yield sse
 
     return StreamingResponse(
         generator(),
@@ -1407,6 +1494,7 @@ class VoiceTokenRequest(BaseModel):
     gender: str  # 'M' | 'F' — speaker gender (parent for pediatric)
     voiceId: Optional[str] = None  # explicit override
     identity: Optional[str] = None  # browser-side participant identity
+    isPediatric: Optional[bool] = False  # parent-speaker route in offline TTS
 
 
 class VoiceTokenResponse(BaseModel):
@@ -1438,6 +1526,7 @@ async def voice_token(req: VoiceTokenRequest):
             "initialLine": req.initialLine,
             "voiceGender": req.gender,
             "voiceId": req.voiceId,
+            "isPediatric": bool(req.isPediatric),
         }
     )
 

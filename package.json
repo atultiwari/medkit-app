@@ -8,7 +8,11 @@
     "build": "node node_modules/typescript/bin/tsc -b && node node_modules/vite/bin/vite.js build",
     "preview": "node node_modules/vite/bin/vite.js preview",
     "verify": "node scripts/verify/run-all.ts",
-    "test": "node scripts/test/run-all.ts"
+    "test": "node scripts/test/run-all.ts",
+    "setup:offline": "bash scripts/setup-offline.sh",
+    "dev:offline": "docker compose -f docker-compose.offline.yml up",
+    "dev:offline:gpu": "docker compose -f docker-compose.offline.yml -f docker-compose.gpu.yml up",
+    "dev:offline:down": "docker compose -f docker-compose.offline.yml down"
   },
   "dependencies": {
     "@react-three/drei": "^9.122.0",

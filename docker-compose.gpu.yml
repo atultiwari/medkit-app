@@ -1,0 +1,28 @@
+# GPU overlay for the offline stack — NVIDIA only.
+#
+# Stacks on top of docker-compose.offline.yml:
+#   docker compose -f docker-compose.offline.yml -f docker-compose.gpu.yml up
+#
+# Requires the NVIDIA Container Toolkit installed on the host:
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  whisper:
+    environment:
+      WHISPER_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
